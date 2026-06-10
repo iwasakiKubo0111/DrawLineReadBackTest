@@ -3,6 +3,7 @@
 
 #include "RT_Display10.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "ManagerActor.h"
 
 void URT_Display10::NativeConstruct()
 {
@@ -38,7 +39,7 @@ void URT_Display10::BindRenderTarget(UTextureRenderTarget2D* renderTarget)
 //    m_rtImage1->SetBrushFromMaterial(MID);
 //}
 
-void URT_Display10::BindCell(UTextureRenderTarget2D* renderTarget, int32 Cols, int32 Rows)
+void URT_Display10::BindCell(UTextureRenderTarget2D* renderTarget, const FCellLayout& Layout)
 {
     if (!m_cellMaterial) return;
 
@@ -56,21 +57,21 @@ void URT_Display10::BindCell(UTextureRenderTarget2D* renderTarget, int32 Cols, i
     imageArray.Add(m_rtImage9);
     imageArray.Add(m_rtImage10);
 
-    int cellMax = 10;
-    for (int cellIdx = 0; cellIdx < cellMax; cellIdx++)
+    for (int32 i = 0; i < imageArray.Num(); i++)
     {
-        const int32 Col = cellIdx % Cols;
-        const int32 Row = cellIdx / Cols;
+        if (!imageArray[i]) continue;
+
+        const int32 Col = i % Layout.Cols;
+        const int32 Row = i / Layout.Cols;
+
+        FVector2D scale, offset;
+        Layout.GetCellUV(Col, Row, scale, offset);
 
         UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(m_cellMaterial, this);
         MID->SetTextureParameterValue(TEXT("RT"), renderTarget);
+        MID->SetVectorParameterValue(TEXT("UVScale"), FLinearColor(scale.X, scale.Y, 0.f, 0.f));
+        MID->SetVectorParameterValue(TEXT("UVOffset"), FLinearColor(offset.X, offset.Y, 0.f, 0.f));
 
-        // セル1枚ぶんに縮小し、対象セルの左上へオフセット
-        MID->SetVectorParameterValue(TEXT("UVScale"),
-            FLinearColor(1.f / Cols, 1.f / Rows, 0.f, 0.f));
-        MID->SetVectorParameterValue(TEXT("UVOffset"),
-            FLinearColor((float)Col / Cols, (float)Row / Rows, 0.f, 0.f));
-
-        imageArray[cellIdx]->SetBrushFromMaterial(MID);
+        imageArray[i]->SetBrushFromMaterial(MID);
     }
 }

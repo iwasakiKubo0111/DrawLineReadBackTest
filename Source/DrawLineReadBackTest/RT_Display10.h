@@ -7,6 +7,8 @@
 #include <Components/Image.h>
 #include "RT_Display10.generated.h"
 
+struct FCellLayout;
+
 /**
  *
  */
@@ -22,7 +24,7 @@ public:
 
 	//void BindCell(UTextureRenderTarget2D* RT, int32 CellIndex, int32 Cols, int32 Rows);
 
-	void BindCell(UTextureRenderTarget2D* RT, int32 Cols, int32 Rows);
+	void BindCell(UTextureRenderTarget2D* RT, const FCellLayout& Layout);
 
 	UPROPERTY(meta = (BindWidget))
 	UImage* m_rtImage1 = nullptr;

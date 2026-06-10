@@ -11,6 +11,38 @@
 class UWidget;
 class UPoseableMeshComponent;
 
+USTRUCT(BlueprintType)
+struct FCellLayout
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere) int32 Cols = 5;
+	UPROPERTY(EditAnywhere) int32 Rows = 2;
+	UPROPERTY(EditAnywhere) int32 CellSize = 512;   // UV切り取りで担保する解像度(px)
+	UPROPERTY(EditAnywhere) int32 Margin = 0;       // セル間の余白(px)
+	UPROPERTY(EditAnywhere) int32 EdgeMargin = 0;   // 外周の余白(px) 0でもOK
+
+	int32 MasterWidth()  const { return EdgeMargin * 2 + CellSize * Cols + Margin * FMath::Max(0, Cols - 1); }
+	int32 MasterHeight() const { return EdgeMargin * 2 + CellSize * Rows + Margin * FMath::Max(0, Rows - 1); }
+
+	// セル中身の左上ピクセル座標
+	FIntPoint CellPixelOrigin(int32 Col, int32 Row) const
+	{
+		return FIntPoint(EdgeMargin + Col * (CellSize + Margin),
+			EdgeMargin + Row * (CellSize + Margin));
+	}
+
+	// 正規化UV（スケールとオフセット）。余白を考慮してセル中身だけを指す
+	void GetCellUV(int32 Col, int32 Row, FVector2D& OutScale, FVector2D& OutOffset) const
+	{
+		const FIntPoint O = CellPixelOrigin(Col, Row);
+		const float W = (float)MasterWidth();
+		const float H = (float)MasterHeight();
+		OutScale = FVector2D((float)CellSize / W, (float)CellSize / H);
+		OutOffset = FVector2D((float)O.X / W, (float)O.Y / H);
+	}
+};
+
 UCLASS()
 class DRAWLINEREADBACKTEST_API AManagerActor : public AActor
 {
@@ -33,7 +65,13 @@ public:
 	void SetWidget(UWidget* setWidget, TSharedPtr<class SOverlay> overlay);
 	void SetCaptureEnabled(bool bEnabled);
 
-	FVector GetCellCenterWorld(int32 Col, int32 Row, int32 Cols, int32 Rows, float DistanceInFront) const;
+	FVector GetCellCenterWorld(int32 Col, int32 Row, float DistanceInFront) const;
+
+	UFUNCTION(BlueprintCallable)
+	void SetCellTarget(int32 CellIndex, AActor* NewTarget);
+
+	UPROPERTY(EditAnywhere, Category = "Layout")
+	FCellLayout m_layout;     // 追加（エディタで余白等を設定）
 
 	TSubclassOf<UUserWidget> m_mtRtWidgetClass;
 	TSubclassOf<UUserWidget> m_rt10WidgetClass;
@@ -44,7 +82,7 @@ public:
 	TArray<TSharedPtr<SWindow>> m_windows; // 生成したウィンドウをまとめて保持
 
 	UPROPERTY()
-	TArray<TObjectPtr<UPoseableMeshComponent>> m_poseComponents;
+	TArray<TObjectPtr<USkeletalMeshComponent>> m_followerComponents;
 
 	USceneCaptureComponent2D* m_sceneCapture2D = NULL;
 	UTextureRenderTarget2D* m_masterRenderTarget = NULL;
