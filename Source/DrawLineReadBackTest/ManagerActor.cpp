@@ -8,6 +8,9 @@
 #include "RT_DisplayWidget.h"
 #include "RT_Display10.h"
 #include <Components/PoseableMeshComponent.h>
+#include "CanvasTypes.h"        // FCanvas 本体（ET_Line/ET_Triangle もこれで解決）
+#include "BatchedElements.h"    // FBatchedElements
+#include "ImageUtils.h"         // FImageUtils::SaveImageByExtension
 
 #define DPI_SCALE 1.5
 #define WINDOW_HIGHT_SIZE 2160 / DPI_SCALE
@@ -172,7 +175,12 @@ void AManagerActor::BeginPlay()
 			//m_sceneCapture2D->ShowOnlyComponents.Add(pose);
 		}
 	}
-	
+
+	// スナップショット作業用RT（セルと同サイズ・同フォーマット）
+	{
+		m_snapshotRT = UKismetRenderingLibrary::CreateRenderTarget2D(
+			this, m_layout.CellSize, m_layout.CellSize, RTF_RGBA8, FLinearColor::Transparent, false);
+	}
 }
 
 void AManagerActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -203,6 +211,18 @@ void AManagerActor::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	if (m_snapState == ESnapshotState::PendingReadback && GFrameCounter > m_snapRequestFrame)
+	{
+		// フレームN+1：マスターRTにはNの終端で撮れた絵が入っている
+		EnqueueSnapshotDrawAndReadback(m_snapCellIndex);
+		SetCellTarget(0, m_captureActor2);   // ここで戻す
+		m_snapState = ESnapshotState::WaitingReadback;
+	}
+	else if (m_snapState == ESnapshotState::WaitingReadback && m_readback.IsReady())
+	{
+		SaveSnapshotPNG();
+		m_snapState = ESnapshotState::Idle;
+	}
 }
 
 TSharedPtr<class SOverlay> AManagerActor::CreateWindow(const FVector2D& windowSize, const FVector2D& windowPos, const FText& tilte)
@@ -309,6 +329,142 @@ void AManagerActor::SetCellTarget(int32 CellIndex, AActor* NewTarget)
 
 	// ③ リーダーのポーズに追従
 	follower->SetLeaderPoseComponent(leader);
+}
+
+void AManagerActor::TestSnapShot(int32 SnapCellIndex)
+{
+	if (m_snapState != ESnapshotState::Idle) return;
+	if (!m_sceneCapture2D || !m_masterRenderTarget || !m_snapshotRT) return;
+
+	// 前提：bCaptureEveryFrame = true（プレビューと共用）
+
+	// フレームN：差し替えるだけ。撮影は毎フレームのキャプチャに任せる
+	SetCellTarget(0, m_captureActor);
+
+	m_snapCellIndex = SnapCellIndex;
+	m_snapRequestFrame = GFrameCounter;
+	m_snapState = ESnapshotState::PendingReadback;
+	// ★ここでは戻さない（同フレームで戻すと戻した状態が撮られる）
+}
+
+void AManagerActor::EnqueueSnapshotDrawAndReadback(int32 CellIndex)
+{
+	if (!m_masterRenderTarget || !m_snapshotRT) return;
+
+	const int32 Col = CellIndex % m_layout.Cols;
+	const int32 Row = CellIndex / m_layout.Cols;
+
+	FTextureRenderTargetResource* MasterRes = m_masterRenderTarget->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* SnapRes = m_snapshotRT->GameThread_GetRenderTargetResource();
+	const FIntPoint CellOrigin = m_layout.CellPixelOrigin(Col, Row); // ★指定セルの左上(px)
+	const int32 CellSize = m_layout.CellSize;
+
+	const FTexture* MarkTex =
+		(m_markTexture && m_markTexture->GetResource()) ? m_markTexture->GetResource() : nullptr;
+
+	// ---- テスト用の描画データ（座標はセルローカル 0〜CellSize）----
+	TArray<FVector2D> Points;
+	{
+		FVector2D P(CellSize * 0.5f, CellSize * 0.5f);
+		for (int32 i = 0; i < 300; ++i)
+		{
+			P += FVector2D(FMath::FRandRange(-20.f, 20.f), FMath::FRandRange(-20.f, 20.f));
+			P.X = FMath::Clamp(P.X, 0.f, (float)CellSize);
+			P.Y = FMath::Clamp(P.Y, 0.f, (float)CellSize);
+			Points.Add(P);
+		}
+	}
+	TArray<FVector2D> MarkPoints;
+	for (int32 i = 0; i < 5; ++i)
+	{
+		MarkPoints.Add(FVector2D(FMath::FRandRange(0.f, (float)CellSize),
+			FMath::FRandRange(0.f, (float)CellSize)));
+	}
+
+	ENQUEUE_RENDER_COMMAND(SnapshotDrawReadbackCmd)(
+		[this, MasterRes, SnapRes, CellOrigin, CellSize, MarkTex,
+		Points = MoveTemp(Points), MarkPoints = MoveTemp(MarkPoints)]
+		(FRHICommandListImmediate& RHICmdList)
+		{
+			FRHITexture* Src = MasterRes ? MasterRes->GetRenderTargetTexture() : nullptr;
+			FRHITexture* Dst = SnapRes ? SnapRes->GetRenderTargetTexture() : nullptr;
+			if (!Src || !Dst) return;
+
+			// ① マスターRTのセル0領域をスナップショットRTへGPUコピー
+			RHICmdList.Transition(FRHITransitionInfo(Src, ERHIAccess::Unknown, ERHIAccess::CopySrc));
+			RHICmdList.Transition(FRHITransitionInfo(Dst, ERHIAccess::Unknown, ERHIAccess::CopyDest));
+
+			FRHICopyTextureInfo CopyInfo;
+			CopyInfo.SourcePosition = FIntVector(CellOrigin.X, CellOrigin.Y, 0);
+			CopyInfo.DestPosition = FIntVector(0, 0, 0);
+			CopyInfo.Size = FIntVector(CellSize, CellSize, 1);
+			RHICmdList.CopyTexture(Src, Dst, CopyInfo);
+
+			// コピー後、マスターは読み取り系へ、スナップは描画先へ
+			RHICmdList.Transition(FRHITransitionInfo(Src, ERHIAccess::CopySrc, ERHIAccess::SRVMask));
+			RHICmdList.Transition(FRHITransitionInfo(Dst, ERHIAccess::CopyDest, ERHIAccess::RTV));
+
+			// ② コピーしたセル画像の上に線・マークを描く（★Clearしない＝上描き）
+			FCanvas Canvas(SnapRes, nullptr, FGameTime(), GMaxRHIFeatureLevel);
+			const FHitProxyId HitId = Canvas.GetHitProxyId();
+
+			if (Points.Num() >= 2)
+			{
+				FBatchedElements* LineBatch = Canvas.GetBatchedElements(FCanvas::ET_Line);
+				LineBatch->AddReserveLines(Points.Num() - 1, false, /*bThickLines=*/true);
+				for (int32 i = 1; i < Points.Num(); ++i)
+				{
+					LineBatch->AddLine(
+						FVector(Points[i - 1].X, Points[i - 1].Y, 0.f),
+						FVector(Points[i].X, Points[i].Y, 0.f),
+						FLinearColor::Red, HitId, 2.0f);
+				}
+			}
+
+			if (MarkTex && MarkPoints.Num() > 0)
+			{
+				const ESimpleElementBlendMode BlendMode = SE_BLEND_Masked;
+				FBatchedElements* SpriteBatch =
+					Canvas.GetBatchedElements(FCanvas::ET_Triangle, nullptr, MarkTex, BlendMode);
+				for (const FVector2D& M : MarkPoints)
+				{
+					SpriteBatch->AddSprite(
+						FVector(M.X, M.Y, 0.f), 12.f, 12.f, MarkTex,
+						FLinearColor::White, HitId,
+						0.f, 0.f, 0.f, 0.f, (uint8)BlendMode, 0.33f);
+				}
+			}
+
+			Canvas.Flush_RenderThread(RHICmdList);
+
+			// ③ 描き終わったスナップショットRTをそのまま非同期Readback依頼
+			m_readback.EnqueueCopy(RHICmdList, Dst);
+		});
+}
+
+void AManagerActor::SaveSnapshotPNG()
+{
+	int32 RowPitchInPixels = 0;
+	void* Data = m_readback.Lock(RowPitchInPixels);
+	if (!Data) { UE_LOG(LogTemp, Error, TEXT("[Snapshot] Lock失敗")); return; }
+
+	const int32 W = m_layout.CellSize, H = m_layout.CellSize;
+	TArray<FColor> Pixels;
+	Pixels.SetNumUninitialized(W * H);
+	const FColor* SrcPx = reinterpret_cast<const FColor*>(Data);
+	for (int32 Y = 0; Y < H; ++Y)
+	{
+		FMemory::Memcpy(&Pixels[Y * W], &SrcPx[Y * RowPitchInPixels], W * sizeof(FColor));
+	}
+	m_readback.Unlock();
+
+	// PNG圧縮とディスク書き込みは重いのでワーカースレッドへ（ヒッチ回避）
+	Async(EAsyncExecution::ThreadPool,
+		[Pixels = MoveTemp(Pixels), W, H, Path = m_snapshotOutputPath]() mutable
+		{
+			FImageView ImageView(Pixels.GetData(), W, H, ERawImageFormat::BGRA8);
+			FImageUtils::SaveImageByExtension(*Path, ImageView);
+		});
 }
 
 //https://claude.ai/share/891bba44-837d-4d94-bbcd-4725dbbcf6be
