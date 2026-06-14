@@ -19,6 +19,30 @@ enum class ESnapshotState : uint8
 	WaitingReadback
 };
 
+// 1回の撮影リクエスト（今後フィールド追加しやすいよう構造体に）
+USTRUCT(BlueprintType)
+struct FSnapshotRequest
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadWrite) int32 CellIndex = 0;
+	UPROPERTY(BlueprintReadWrite) AActor* TargetActor = nullptr;
+	UPROPERTY(BlueprintReadWrite) FRotator Rotation = FRotator::ZeroRotator;
+	UPROPERTY(BlueprintReadWrite) FString OutputPath;
+
+	uint64 SwapFrame = 0;   // 差し替えを行ったGFrameCounter
+
+	// 内部進行状態（差し替え済みか）
+	bool bSwapped = false;
+};
+
+// 進行中の1回ぶんのReadback（複数本並行用）
+struct FSnapshotReadbackJob
+{
+	TUniquePtr<FRHIGPUTextureReadback> Readback;
+	TArray<FSnapshotRequest> Requests; // この1回のReadbackに含まれる撮影対象（セルごと）
+};
+
 USTRUCT(BlueprintType)
 struct FCellLayout
 {
@@ -81,11 +105,15 @@ public:
 	void SetCellTarget(int32 CellIndex, AActor* NewTarget);
 
 	UFUNCTION(BlueprintCallable)
-	void TestSnapShot(int32 SnapCellIndex);
+	void TestSnapShot(const FSnapshotRequest& Request);   // 1回1セルぶんを積む
 
-	void EnqueueSnapshotDrawAndReadback(int32 CellIndex);        // 引数追加
+	//void EnqueueSnapshotDrawAndReadback(int32 CellIndex);        // 引数追加
 
-	void SaveSnapshotPNG();
+	//void SaveSnapshotPNG();
+
+	void ProcessSnapshotQueues();                          // 毎Tick：差し替え進行＋撮影発行
+	void EnqueueAtlasReadback(const TArray<FSnapshotRequest>& ShotsThisFrame); // 全体1Readback
+	void SaveFromAtlas(FSnapshotReadbackJob& Job);         // 完了後：全体から各セル切り出し保存
 
 	UPROPERTY(EditAnywhere, Category = "Layout")
 	FCellLayout m_layout;     // 追加（エディタで余白等を設定）
@@ -110,13 +138,18 @@ public:
 	USceneCaptureComponent2D* m_sceneCapture2D = NULL;
 	UTextureRenderTarget2D* m_masterRenderTarget = NULL;
 
-	FRHIGPUTextureReadback m_readback{ TEXT("SnapshotReadback") };
-	ESnapshotState m_snapState = ESnapshotState::Idle;
+	// セルごとのキュー（添字＝セル番号）
+	TArray<TArray<FSnapshotRequest>> m_cellQueues;
+
+	// 並行で走っているReadbackジョブ群
+	TArray<TSharedPtr<FSnapshotReadbackJob>> m_readbackJobs;
+
+	// ヘッダ：セルごとの「本来狙っているアクタ」を保持
+	UPROPERTY(EditAnywhere)
+	TArray<TObjectPtr<AActor>> m_cellDefaultTargets; // BeginPlayで SetNum(セル数)
+
 	uint64 m_snapRequestFrame = 0;
 	int32  m_snapCellIndex = 0;
-
-	UPROPERTY()
-	TObjectPtr<UTextureRenderTarget2D> m_snapshotRT = nullptr; // セル1枚ぶん(512x512)の作業用RT
 
 	UPROPERTY(EditAnywhere, Category = "Capture")
 	TObjectPtr<UTexture2D> m_markTexture = nullptr;   // ×マーク等（エディタで割当。無くても線だけ描く）
