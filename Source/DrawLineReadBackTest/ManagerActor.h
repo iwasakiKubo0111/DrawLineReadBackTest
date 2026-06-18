@@ -30,6 +30,9 @@ struct FSnapshotRequest
 	UPROPERTY(BlueprintReadWrite) FRotator Rotation = FRotator::ZeroRotator;
 	UPROPERTY(BlueprintReadWrite) FString OutputPath;
 
+	// 着弾点（リーダーアクタのローカル座標）。複数当たりに備え配列
+	UPROPERTY(BlueprintReadWrite) TArray<FVector> LocalHitPoints;
+
 	uint64 SwapFrame = 0;   // 差し替えを行ったGFrameCounter
 
 	// 内部進行状態（差し替え済みか）
@@ -114,6 +117,30 @@ public:
 	void ProcessSnapshotQueues();                          // 毎Tick：差し替え進行＋撮影発行
 	void EnqueueAtlasReadback(const TArray<FSnapshotRequest>& ShotsThisFrame); // 全体1Readback
 	void SaveFromAtlas(FSnapshotReadbackJob& Job);         // 完了後：全体から各セル切り出し保存
+
+	// アクタからバウンズ寸法（cm, 直径相当）を取得。近傍パネル基準にしたくなったらここを差し替える
+	float GetTargetBoundsExtentSize(AActor* Target) const;
+
+	// セル収めスケールを計算してフォロワーへ適用
+	void ApplyFitScale(int32 CellIndex, AActor* Target);
+
+	UFUNCTION(BlueprintCallable, Category = "Capture")
+	static FVector WorldHitToActorLocal(AActor* LeaderActor, const FVector& WorldHit)
+	{
+		return LeaderActor ? LeaderActor->GetActorTransform().InverseTransformPosition(WorldHit)
+			: WorldHit;
+	}
+
+	// 着弾点 → セルローカルピクセル変換
+	FVector2D CellLocalPixelFromLocalHit(int32 CellIndex, const FVector& LocalHit) const;
+
+
+	// 全体スケール調整用（後から見た目を一括で詰めたいとき用）
+	UPROPERTY(EditAnywhere, Category = "Capture")
+	float m_cellFillRatio = 0.8f;   // セルに対してバウンズ最大辺をどれだけ占めるか（余白確保）
+
+	UPROPERTY(EditAnywhere, Category = "Capture")
+	float m_scaleMultiplier = 1.0f; // さらに全体を微調整したいときの係数
 
 	UPROPERTY(EditAnywhere, Category = "Layout")
 	FCellLayout m_layout;     // 追加（エディタで余白等を設定）

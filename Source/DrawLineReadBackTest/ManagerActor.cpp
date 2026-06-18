@@ -16,6 +16,20 @@
 #define WINDOW_HIGHT_SIZE 2160 / DPI_SCALE
 #define WINDOW_WIDTH_SIZE 3840 / DPI_SCALE
 
+static FORCEINLINE void PutPixel(TArray<FColor>& Buf, int32 W, int32 H, int32 X, int32 Y, const FColor& C)
+{
+	if (X < 0 || Y < 0 || X >= W || Y >= H) return;
+	Buf[Y * W + X] = C;
+}
+
+static void DrawFilledCircleCPU(TArray<FColor>& Buf, int32 W, int32 H, FIntPoint Center, int32 Radius, const FColor& C)
+{
+	for (int32 dy = -Radius; dy <= Radius; ++dy)
+		for (int32 dx = -Radius; dx <= Radius; ++dx)
+			if (dx * dx + dy * dy <= Radius * Radius)
+				PutPixel(Buf, W, H, Center.X + dx, Center.Y + dy, C);
+}
+
 // Sets default values
 AManagerActor::AManagerActor()
 {
@@ -81,7 +95,7 @@ void AManagerActor::BeginPlay()
 			m_layout.MasterWidth(),
 			m_layout.MasterHeight(),
 			RTF_RGBA8,
-			FLinearColor::Black,
+			FLinearColor::White,
 			/*bAutoGenerateMipMaps=*/false);
 
 		// キャプチャ先として割り当て これ以降、毎フレーム RT へ描画される。
@@ -330,6 +344,9 @@ void AManagerActor::SetCellTarget(int32 CellIndex, AActor* NewTarget)
 
 	// ③ リーダーのポーズに追従
 	follower->SetLeaderPoseComponent(leader);
+
+	// ★差し替えのたびにセル収めスケールを適用（近傍パネル基準のバウンズで算出）
+	ApplyFitScale(CellIndex, NewTarget);
 }
 
 void AManagerActor::TestSnapShot(const FSnapshotRequest& Request)
@@ -577,19 +594,16 @@ void AManagerActor::SaveFromAtlas(FSnapshotReadbackJob& Job)
 	void* Data = Job.Readback->Lock(RowPitchInPixels);
 	if (!Data) { UE_LOG(LogTemp, Error, TEXT("[Snapshot] Atlas Lock失敗")); return; }
 
-	const int32 MW = m_layout.MasterWidth();
-	const int32 MH = m_layout.MasterHeight();
 	const int32 CS = m_layout.CellSize;
 	const FColor* Atlas = reinterpret_cast<const FColor*>(Data);
 
-	// 各撮影対象セルを切り出してワーカースレッドで保存
 	for (const FSnapshotRequest& Req : Job.Requests)
 	{
 		const int32 Col = Req.CellIndex % m_layout.Cols;
 		const int32 Row = Req.CellIndex / m_layout.Cols;
 		const FIntPoint O = m_layout.CellPixelOrigin(Col, Row);
 
-		// セル領域(CS×CS)をアトラスから抜き出してCPUバッファへ
+		// セル領域(CS×CS)を切り出し
 		TArray<FColor> Cell;
 		Cell.SetNumUninitialized(CS * CS);
 		for (int32 y = 0; y < CS; ++y)
@@ -598,16 +612,107 @@ void AManagerActor::SaveFromAtlas(FSnapshotReadbackJob& Job)
 			FMemory::Memcpy(&Cell[y * CS], SrcRow, CS * sizeof(FColor));
 		}
 
-		// エンコード＋保存はワーカースレッドへ
+		// Cell 切り出し直後、Async に渡す前
+		const FColor Center = Cell[(CS / 2) * CS + (CS / 2)];
+		UE_LOG(LogTemp, Log, TEXT("[Snapshot] Cell=%d centerPixel=(R=%d G=%d B=%d A=%d)"),
+			Req.CellIndex, Center.R, Center.G, Center.B, Center.A);
+
+		for (FColor& Px : Cell) { Px.A = 255; }
+
+		// 着弾点をセルローカルピクセルへ変換（GameThread上で。フォロワーTransform参照のため）
+		TArray<FIntPoint> HitPixels;
+		for (const FVector& LocalHit : Req.LocalHitPoints)
+		{
+			const FVector2D P = CellLocalPixelFromLocalHit(Req.CellIndex, LocalHit);
+			HitPixels.Add(FIntPoint(FMath::RoundToInt(P.X), FMath::RoundToInt(P.Y)));
+		}
+
+		// 切り出し済みピクセル＋着弾ピクセルをワーカースレッドへ渡して、描画＋保存
 		Async(EAsyncExecution::ThreadPool,
-			[Cell = MoveTemp(Cell), CS, Path = Req.OutputPath]() mutable
+			[Cell = MoveTemp(Cell), CS, HitPixels = MoveTemp(HitPixels), Path = Req.OutputPath]() mutable
 			{
+				for (const FIntPoint& HP : HitPixels)
+				{
+					DrawFilledCircleCPU(Cell, CS, CS, HP, 6, FColor(255, 0, 0, 255)); // 赤い着弾点
+				}
 				FImageView ImageView(Cell.GetData(), CS, CS, ERawImageFormat::BGRA8);
 				FImageUtils::SaveImageByExtension(*Path, ImageView);
 			});
 	}
 
 	Job.Readback->Unlock();
+}
+
+float AManagerActor::GetTargetBoundsExtentSize(AActor* Target) const
+{
+	if (!Target)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Bounds] Target が null"));
+		return 0.f;
+	}
+
+	FVector Origin, BoxExtent;
+	Target->GetActorBounds(/*bOnlyCollidingComponents=*/false, Origin, BoxExtent, /*bIncludeFromChildActors=*/true);
+
+	const FVector FullSize = BoxExtent * 2.f;
+	const float MaxSize = FMath::Max3(FullSize.X, FullSize.Y, FullSize.Z);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[Bounds] %s 直径(X,Y,Z)=(%.1f, %.1f, %.1f) 最大辺=%.1f cm"),
+		*Target->GetName(), FullSize.X, FullSize.Y, FullSize.Z, MaxSize);
+
+	return MaxSize;
+}
+
+void AManagerActor::ApplyFitScale(int32 CellIndex, AActor* Target)
+{
+	if (!m_followerComponents.IsValidIndex(CellIndex) || !m_followerComponents[CellIndex]) return;
+	USkeletalMeshComponent* Follower = m_followerComponents[CellIndex];
+
+	const float BoundsSize = GetTargetBoundsExtentSize(Target);
+	if (BoundsSize <= KINDA_SMALL_NUMBER)
+	{
+		Follower->SetWorldScale3D(FVector(1.f));
+		return;
+	}
+
+	// セルのワールド一辺(cm) = CellSize（1cm/px）。その fillRatio ぶんに最大辺を収める。
+	const float CellWorld = (float)m_layout.CellSize;
+	const float Scale = (CellWorld * m_cellFillRatio / BoundsSize) * m_scaleMultiplier;
+
+	Follower->SetWorldScale3D(FVector(Scale));
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[FitScale] Cell=%d Bounds=%.1f CellWorld=%.1f fill=%.2f mult=%.2f → Scale=%.4f"),
+		CellIndex, BoundsSize, CellWorld, m_cellFillRatio, m_scaleMultiplier, Scale);
+}
+
+FVector2D AManagerActor::CellLocalPixelFromLocalHit(int32 CellIndex, const FVector& LocalHit) const
+{
+	if (!m_followerComponents.IsValidIndex(CellIndex) || !m_followerComponents[CellIndex])
+		return FVector2D(-1.f, -1.f);
+
+	USkeletalMeshComponent* Follower = m_followerComponents[CellIndex];
+
+	// ① リーダーローカルの着弾点を、フォロワーのワールド変換（位置・回転・スケール込み）で再構成
+	const FVector WorldOnFollower = Follower->GetComponentTransform().TransformPosition(LocalHit);
+
+	// ② 正射影でアトラスピクセルへ（1cm/px）
+	const FVector C = m_sceneCapture2D->GetComponentLocation();
+	const FVector R = m_sceneCapture2D->GetRightVector();
+	const FVector U = m_sceneCapture2D->GetUpVector();
+	const float MW = (float)m_layout.MasterWidth();
+	const float MH = (float)m_layout.MasterHeight();
+
+	const FVector D = WorldOnFollower - C;
+	const float atlasX = MW * 0.5f + FVector::DotProduct(D, R);
+	const float atlasY = MH * 0.5f - FVector::DotProduct(D, U); // 上(+U)は画面上＝y小さい
+
+	// ③ セル原点を引いてローカルへ
+	const int32 Col = CellIndex % m_layout.Cols;
+	const int32 Row = CellIndex / m_layout.Cols;
+	const FIntPoint O = m_layout.CellPixelOrigin(Col, Row);
+	return FVector2D(atlasX - O.X, atlasY - O.Y);
 }
 
 //https://claude.ai/share/891bba44-837d-4d94-bbcd-4725dbbcf6be
