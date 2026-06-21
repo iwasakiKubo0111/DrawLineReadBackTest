@@ -11,6 +11,7 @@
 #include "CanvasTypes.h"        // FCanvas 本体（ET_Line/ET_Triangle もこれで解決）
 #include "BatchedElements.h"    // FBatchedElements
 #include "ImageUtils.h"         // FImageUtils::SaveImageByExtension
+#include "ImageCore.h"
 
 #define DPI_SCALE 1.5
 #define WINDOW_HIGHT_SIZE 2160 / DPI_SCALE
@@ -28,6 +29,31 @@ static void DrawFilledCircleCPU(TArray<FColor>& Buf, int32 W, int32 H, FIntPoint
 		for (int32 dx = -Radius; dx <= Radius; ++dx)
 			if (dx * dx + dy * dy <= Radius * Radius)
 				PutPixel(Buf, W, H, Center.X + dx, Center.Y + dy, C);
+}
+
+static void DrawThickLineCPU(TArray<FColor>& Buf, int32 W, int32 H,
+	FIntPoint A, FIntPoint B, const FColor& C, int32 Thickness)
+{
+	const int32 r = FMath::Max(0, Thickness / 2);
+	int32 x0 = A.X, y0 = A.Y, x1 = B.X, y1 = B.Y;
+	const int32 dx = FMath::Abs(x1 - x0), dy = -FMath::Abs(y1 - y0);
+	const int32 sx = (x0 < x1) ? 1 : -1;
+	const int32 sy = (y0 < y1) ? 1 : -1;
+	int32 err = dx + dy;
+
+	while (true)
+	{
+		// 太さぶん円形に塗る
+		for (int32 oy = -r; oy <= r; ++oy)
+			for (int32 ox = -r; ox <= r; ++ox)
+				if (ox * ox + oy * oy <= r * r)
+					PutPixel(Buf, W, H, x0 + ox, y0 + oy, C);
+
+		if (x0 == x1 && y0 == y1) break;
+		const int32 e2 = 2 * err;
+		if (e2 >= dy) { err += dy; x0 += sx; }
+		if (e2 <= dx) { err += dx; y0 += sy; }
+	}
 }
 
 // Sets default values
@@ -194,6 +220,8 @@ void AManagerActor::BeginPlay()
 	{
 		m_cellQueues.SetNum(m_layout.Cols* m_layout.Rows);
 	}
+
+	LoadMarkTextureToCPU();
 }
 
 void AManagerActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -226,7 +254,11 @@ void AManagerActor::Tick(float DeltaTime)
 
 	Super::Tick(DeltaTime);
 
+	UpdateFollowerRotations();   // リアルタイム表示の向き合わせ
+
 	ProcessSnapshotQueues();
+
+	ProcessTrailSaveQueue();
 
 	// 完了したReadbackジョブから保存（複数本並行、完了順に処理）
 	for (int32 i = m_readbackJobs.Num() - 1; i >= 0; --i)
@@ -347,31 +379,55 @@ void AManagerActor::SetCellTarget(int32 CellIndex, AActor* NewTarget)
 
 	// ★差し替えのたびにセル収めスケールを適用（近傍パネル基準のバウンズで算出）
 	ApplyFitScale(CellIndex, NewTarget);
+
+	// 回転追従の対象として記録
+	if (m_cellRotationTargets.Num() != m_layout.Cols * m_layout.Rows)
+	{
+		m_cellRotationTargets.SetNum(m_layout.Cols * m_layout.Rows);
+	}
+	if (m_cellRotationTargets.IsValidIndex(CellIndex))
+	{
+		m_cellRotationTargets[CellIndex] = NewTarget;
+	}
+
+	CacheCenterOffsetLocal(CellIndex);
 }
 
-void AManagerActor::TestSnapShot(const FSnapshotRequest& Request)
+void AManagerActor::TestSnapShot(const FSnapshotRequest& RequestIn)
 {
 	const int32 cellCount = m_layout.Cols * m_layout.Rows;
-	if (Request.CellIndex < 0 || Request.CellIndex >= cellCount) return;
+	if (RequestIn.CellIndex < 0 || RequestIn.CellIndex >= cellCount) return;
 	if (m_cellQueues.Num() != cellCount) m_cellQueues.SetNum(cellCount);
 
-	TArray<FSnapshotRequest>& Queue = m_cellQueues[Request.CellIndex];
-	const bool bBecomesHead = (Queue.Num() == 0); // この新規が先頭になるか
+	// ① 連番採番＆パス確定
+	const int32 ShotId = ++m_shotCounter;
+	FSnapshotRequest Request = RequestIn; // コピーして書き換える
+	Request.OutputPath = FString::Printf(TEXT("%sshoot%d.png"), *m_outputDir, ShotId);
+	const FString TrailPath = FString::Printf(TEXT("%strail%d.png"), *m_outputDir, ShotId);
 
+	TArray<FSnapshotRequest>& Queue = m_cellQueues[Request.CellIndex];
+	const bool bBecomesHead = (Queue.Num() == 0);
 	Queue.Add(Request);
 
 	if (bBecomesHead)
 	{
-		// 先頭なので即差し替え（Tick順に依存せず次フレーム撮影に間に合う）
 		FSnapshotRequest& Head = Queue[0];
 		SetCellTarget(Request.CellIndex, Head.TargetActor);
-		if (m_followerComponents.IsValidIndex(Request.CellIndex) && m_followerComponents[Request.CellIndex])
-		{
-			m_followerComponents[Request.CellIndex]->SetWorldRotation(Head.Rotation);
-		}
+		// 回転は UpdateFollowerRotations が毎フレーム入れるので、ここでは入れない方が整合
 		Head.bSwapped = true;
-		Head.SwapFrame = GFrameCounter;   // ★いつ差し替えたか記録
+		Head.SwapFrame = GFrameCounter;
 	}
+
+	// ② 着弾ピクセルを計算（差し替え済み前提。複数着弾点があれば代表点でよい）
+	FVector2D HitPixel(m_layout.CellSize * 0.5f, m_layout.CellSize * 0.5f);
+	if (Request.LocalHitPoints.Num() > 0)
+	{
+		HitPixel = CellLocalPixelFromLocalHit(Request.CellIndex, Request.LocalHitPoints[0]);
+	}
+
+	// ③ 軌跡用：今の着弾点を記録＆2秒後保存を予約
+	RecordTrailPoint(HitPixel);
+	RequestTrailSave(Request.CellIndex, TrailPath);
 }
 
 //void AManagerActor::EnqueueSnapshotDrawAndReadback(int32 CellIndex)
@@ -629,11 +685,13 @@ void AManagerActor::SaveFromAtlas(FSnapshotReadbackJob& Job)
 
 		// 切り出し済みピクセル＋着弾ピクセルをワーカースレッドへ渡して、描画＋保存
 		Async(EAsyncExecution::ThreadPool,
-			[Cell = MoveTemp(Cell), CS, HitPixels = MoveTemp(HitPixels), Path = Req.OutputPath]() mutable
+			[Cell = MoveTemp(Cell), CS, HitPixels = MoveTemp(HitPixels),
+			Mark = m_markPixels, MW = m_markW, MH = m_markH, DrawSize = m_markDrawSize,
+			Path = Req.OutputPath]() mutable
 			{
 				for (const FIntPoint& HP : HitPixels)
 				{
-					DrawFilledCircleCPU(Cell, CS, CS, HP, 6, FColor(255, 0, 0, 255)); // 赤い着弾点
+					BlitMarkScaledCPU(Cell, CS, CS, Mark, MW, MH, HP, DrawSize);
 				}
 				FImageView ImageView(Cell.GetData(), CS, CS, ERawImageFormat::BGRA8);
 				FImageUtils::SaveImageByExtension(*Path, ImageView);
@@ -645,23 +703,19 @@ void AManagerActor::SaveFromAtlas(FSnapshotReadbackJob& Job)
 
 float AManagerActor::GetTargetBoundsExtentSize(AActor* Target) const
 {
-	if (!Target)
+	if (!Target) return 0.f;
+
+	// パネル（子）を含めず、本体スケルタルメッシュのバウンズだけを使う
+	USkeletalMeshComponent* Mesh = Target->FindComponentByClass<USkeletalMeshComponent>();
+	if (Mesh)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[Bounds] Target が null"));
-		return 0.f;
+		const FBoxSphereBounds B = Mesh->Bounds;
+		const FVector FullSize = B.BoxExtent * 2.f;
+		const float MaxSize = FMath::Max3(FullSize.X, FullSize.Y, FullSize.Z);
+		UE_LOG(LogTemp, Log, TEXT("[Bounds] %s mesh 最大辺=%.1f"), *Target->GetName(), MaxSize);
+		return MaxSize;
 	}
-
-	FVector Origin, BoxExtent;
-	Target->GetActorBounds(/*bOnlyCollidingComponents=*/false, Origin, BoxExtent, /*bIncludeFromChildActors=*/true);
-
-	const FVector FullSize = BoxExtent * 2.f;
-	const float MaxSize = FMath::Max3(FullSize.X, FullSize.Y, FullSize.Z);
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[Bounds] %s 直径(X,Y,Z)=(%.1f, %.1f, %.1f) 最大辺=%.1f cm"),
-		*Target->GetName(), FullSize.X, FullSize.Y, FullSize.Z, MaxSize);
-
-	return MaxSize;
+	return 0.f;
 }
 
 void AManagerActor::ApplyFitScale(int32 CellIndex, AActor* Target)
@@ -714,6 +768,222 @@ FVector2D AManagerActor::CellLocalPixelFromLocalHit(int32 CellIndex, const FVect
 	const FIntPoint O = m_layout.CellPixelOrigin(Col, Row);
 	return FVector2D(atlasX - O.X, atlasY - O.Y);
 }
+
+void AManagerActor::LoadMarkTextureToCPU()
+{
+	m_markPixels.Reset();
+	m_markW = m_markH = 0;
+
+	UTexture2D* Tex = LoadObject<UTexture2D>(nullptr, *m_markTexturePath);
+	if (!Tex)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Mark] テクスチャのロード失敗: %s"), *m_markTexturePath);
+		return;
+	}
+
+#if WITH_EDITORONLY_DATA
+	// エディタ/PIE では Source から確実にCPUピクセルを取得できる
+	 FImage Img;
+    if (Tex->Source.IsValid() && Tex->Source.GetMipImage(Img, 0))
+    {
+        Img.ChangeFormat(ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+        m_markW = Img.GetWidth();
+        m_markH = Img.GetHeight();
+
+        // AsBGRA8() は TArrayView（参照）なので、実体へコピーして保持する
+        const TArrayView<const FColor> View = Img.AsBGRA8();
+        m_markPixels = TArray<FColor>(View.GetData(), View.Num());
+
+        UE_LOG(LogTemp, Log, TEXT("[Mark] 読込成功 %dx%d"), m_markW, m_markH);
+        return;
+    }
+#endif
+
+	UE_LOG(LogTemp, Warning, TEXT("[Mark] Source から取得できず（Cooked等）。別経路が必要"));
+}
+
+void AManagerActor::BlitMarkScaledCPU(TArray<FColor>& Dst, int32 DW, int32 DH, const TArray<FColor>& Mark, int32 MW, int32 MH, FIntPoint Center, int32 DrawSize)
+{
+	if (Mark.Num() == 0 || MW <= 0 || MH <= 0) return;
+
+	const int32 OutW = (DrawSize > 0) ? DrawSize : MW;
+	const int32 OutH = (DrawSize > 0) ? DrawSize : MH;
+	const int32 ox = Center.X - OutW / 2;
+	const int32 oy = Center.Y - OutH / 2;
+
+	for (int32 y = 0; y < OutH; ++y)
+	{
+		for (int32 x = 0; x < OutW; ++x)
+		{
+			// 出力座標 → 元テクスチャ座標（最近傍サンプリング）
+			const int32 sx = (OutW > 0) ? (x * MW / OutW) : 0;
+			const int32 sy = (OutH > 0) ? (y * MH / OutH) : 0;
+			const FColor& Src = Mark[sy * MW + sx];
+			if (Src.A == 0) continue; // 透明はスキップ
+
+			const int32 dx = ox + x, dy = oy + y;
+			if (dx < 0 || dy < 0 || dx >= DW || dy >= DH) continue;
+
+			FColor& D = Dst[dy * DW + dx];
+			const float a = Src.A / 255.f;
+			D.R = (uint8)(Src.R * a + D.R * (1 - a));
+			D.G = (uint8)(Src.G * a + D.G * (1 - a));
+			D.B = (uint8)(Src.B * a + D.B * (1 - a));
+			D.A = 255; // 保存画像は不透明前提
+		}
+	}
+}
+
+void AManagerActor::UpdateFollowerRotations()
+{
+	if (!m_playerCamera || !m_sceneCapture2D) return;
+
+	const FQuat CamQ = m_playerCamera->GetComponentQuat();
+	const FQuat CaptureQ = m_sceneCapture2D->GetComponentQuat();
+	const FQuat CamInv = CamQ.Inverse();
+
+	for (int32 cell = 0; cell < m_followerComponents.Num(); ++cell)
+	{
+		USkeletalMeshComponent* Follower = m_followerComponents[cell];
+		if (!Follower) continue;
+
+		AActor* Target = m_cellRotationTargets.IsValidIndex(cell) ? m_cellRotationTargets[cell] : nullptr;
+		if (!Target) continue;
+
+		// カメラ空間でのアクタの向き → キャプチャ基準へ置き直す
+		const FQuat ActorQ = Target->GetActorQuat();
+		const FQuat RelToCamera = CamInv * ActorQ;          // カメラから見たアクタの相対回転
+		const FQuat FollowerQ = CaptureQ * RelToCamera;   // それをキャプチャ基準で再現
+
+		Follower->SetWorldRotation(FollowerQ);
+
+		// 回転のあとにセンターに戻す
+		const int32 Col = cell % m_layout.Cols;
+		const int32 Row = cell / m_layout.Cols;
+		const FVector CellCenter = GetCellCenterWorld(Col, Row, 500.f);
+
+		const FVector LocalCenter = m_cellCenterLocal.IsValidIndex(cell) ? m_cellCenterLocal[cell] : FVector::ZeroVector;
+
+		// 「ローカル中心」が現在の回転・スケールでどれだけ原点から離れるか
+		const FVector RotatedScaledOffset =
+			Follower->GetComponentTransform().TransformVector(LocalCenter); // 回転＋スケールを反映、平行移動なし
+
+		// バウンズ中心がセル中心に来るよう原点を置く
+		Follower->SetWorldLocation(CellCenter - RotatedScaledOffset);
+		//PlaceFollowerCentered(cell);
+	}
+}
+
+void AManagerActor::PlaceFollowerCentered(int32 CellIndex)
+{
+	USkeletalMeshComponent* Follower = m_followerComponents[CellIndex];
+	if (!Follower) return;
+
+	const int32 Col = CellIndex % m_layout.Cols;
+	const int32 Row = CellIndex / m_layout.Cols;
+	const FVector CellCenter = GetCellCenterWorld(Col, Row, 500.f);
+
+	Follower->UpdateBounds();
+	// 原点→バウンズ中心のズレ（現在の配置基準で測る）
+	const FVector CenterOffset = Follower->Bounds.Origin - Follower->GetComponentLocation();
+	// セル中心にバウンズ中心が来る絶対位置へ置き直す
+	Follower->SetWorldLocation(CellCenter - CenterOffset);
+}
+
+void AManagerActor::CacheCenterOffsetLocal(int32 CellIndex)
+{
+	USkeletalMeshComponent* Follower = m_followerComponents[CellIndex];
+	if (!Follower) return;
+	Follower->UpdateBounds();
+	if (m_cellCenterLocal.Num() != m_layout.Cols * m_layout.Rows)
+		m_cellCenterLocal.SetNum(m_layout.Cols * m_layout.Rows);
+
+	// ワールドのバウンズ中心を、フォロワーのローカル空間へ戻して保存
+	const FVector WorldCenter = Follower->Bounds.Origin;
+	m_cellCenterLocal[CellIndex] = Follower->GetComponentTransform().InverseTransformPosition(WorldCenter);
+}
+
+void AManagerActor::RecordTrailPoint(const FVector2D& Pixel)
+{
+	const float Now = GetWorld()->GetTimeSeconds();
+	m_trailPoints.Add({ Now, Pixel });
+
+	// 古い点は破棄（before+after より十分古いものは不要）
+	const float KeepSec = m_trailBeforeSec + m_trailAfterSec + 1.0f;
+	int32 RemoveCount = 0;
+	for (const FTrailPoint& P : m_trailPoints)
+	{
+		if (Now - P.Time > KeepSec) ++RemoveCount; else break;
+	}
+	if (RemoveCount > 0) m_trailPoints.RemoveAt(0, RemoveCount);
+}
+
+void AManagerActor::RequestTrailSave(int32 CellIndex, const FString& Path)
+{
+	FTrailSaveRequest Req;
+	Req.HitTime = GetWorld()->GetTimeSeconds();
+	Req.CellIndex = CellIndex;
+	Req.OutputPath = Path;
+	m_trailSaveQueue.Add(Req);
+}
+
+void AManagerActor::ProcessTrailSaveQueue()
+{
+	const float Now = GetWorld()->GetTimeSeconds();
+
+	for (int32 i = m_trailSaveQueue.Num() - 1; i >= 0; --i)
+	{
+		FTrailSaveRequest& Req = m_trailSaveQueue[i];
+		if (Now < Req.HitTime + m_trailAfterSec) continue; // まだ2秒経っていない
+
+		// 基準時刻の前後範囲の点を、青/赤に振り分けて線分リスト化
+		const float TMin = Req.HitTime - m_trailBeforeSec;
+		const float TMax = Req.HitTime + m_trailAfterSec;
+
+		TArray<FVector2D> Pts;   // 範囲内の点（時刻順）
+		TArray<float>     Times; // 各点の時刻（色分け用）
+		for (const FTrailPoint& P : m_trailPoints)
+		{
+			if (P.Time >= TMin && P.Time <= TMax)
+			{
+				Pts.Add(P.Pixel);
+				Times.Add(P.Time);
+			}
+		}
+
+		const int32 CS = m_layout.CellSize;
+		const float HitTime = Req.HitTime;
+		const int32 Thickness = m_trailThickness;
+		const FString Path = Req.OutputPath;
+
+		// 描画＋保存はワーカースレッドへ
+		Async(EAsyncExecution::ThreadPool,
+			[Pts = MoveTemp(Pts), Times = MoveTemp(Times), CS, HitTime, Thickness, Path]() mutable
+			{
+				TArray<FColor> Buf;
+				Buf.Init(FColor(0, 0, 0, 0), CS * CS); // 透過背景
+
+				for (int32 k = 1; k < Pts.Num(); ++k)
+				{
+					// 線分の色は「後ろ側の点の時刻」で判定（着弾より後なら赤、前なら青）
+					const bool bAfter = (Times[k] > HitTime);
+					const FColor Col = bAfter ? FColor(255, 0, 0, 255) : FColor(0, 0, 255, 255);
+
+					DrawThickLineCPU(Buf, CS, CS,
+						FIntPoint(FMath::RoundToInt(Pts[k - 1].X), FMath::RoundToInt(Pts[k - 1].Y)),
+						FIntPoint(FMath::RoundToInt(Pts[k].X), FMath::RoundToInt(Pts[k].Y)),
+						Col, Thickness);
+				}
+
+				FImageView ImageView(Buf.GetData(), CS, CS, ERawImageFormat::BGRA8);
+				FImageUtils::SaveImageByExtension(*Path, ImageView);
+			});
+
+		m_trailSaveQueue.RemoveAt(i);
+	}
+}
+
+
 
 //https://claude.ai/share/891bba44-837d-4d94-bbcd-4725dbbcf6be
 //https://claude.ai/share/86a5c282-4bb3-45ae-830d-c2288e5df2d5

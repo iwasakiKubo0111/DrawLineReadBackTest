@@ -7,6 +7,7 @@
 #include "GameFramework/Actor.h"
 #include <Components/SceneCaptureComponent2D.h>
 #include "Engine/TextureRenderTarget2D.h"
+#include <Camera/CameraComponent.h>
 #include "ManagerActor.generated.h"
 
 class UWidget;
@@ -44,6 +45,22 @@ struct FSnapshotReadbackJob
 {
 	TUniquePtr<FRHIGPUTextureReadback> Readback;
 	TArray<FSnapshotRequest> Requests; // この1回のReadbackに含まれる撮影対象（セルごと）
+};
+
+// 1点の記録（時刻＋セルローカルピクセル）
+struct FTrailPoint
+{
+	float Time = 0.f;          // ワールド時刻（GetWorld()->GetTimeSeconds()）
+	FVector2D Pixel;           // 記録時のセルローカルピクセル
+};
+
+// 軌跡保存の予約（着弾時に積み、2秒後に発火）
+struct FTrailSaveRequest
+{
+	float HitTime = 0.f;       // この着弾の時刻（色分けの基準）
+	int32 CellIndex = 0;
+	FString OutputPath;        // 軌跡画像の保存先
+	bool bFired = false;
 };
 
 USTRUCT(BlueprintType)
@@ -127,13 +144,39 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Capture")
 	static FVector WorldHitToActorLocal(AActor* LeaderActor, const FVector& WorldHit)
 	{
-		return LeaderActor ? LeaderActor->GetActorTransform().InverseTransformPosition(WorldHit)
+		// 着弾検知時：リーダーの「メッシュコンポーネント」ローカルへ
+		USkeletalMeshComponent* LeaderMesh = LeaderActor->FindComponentByClass<USkeletalMeshComponent>();
+		const FVector LocalHit = LeaderMesh
+			? LeaderMesh->GetComponentTransform().InverseTransformPosition(WorldHit)
 			: WorldHit;
+		return LocalHit;
 	}
 
 	// 着弾点 → セルローカルピクセル変換
 	FVector2D CellLocalPixelFromLocalHit(int32 CellIndex, const FVector& LocalHit) const;
 
+	void LoadMarkTextureToCPU();   // 起動時に一度だけ呼ぶ
+
+	static void BlitMarkScaledCPU(TArray<FColor>& Dst, int32 DW, int32 DH, const TArray<FColor>& Mark, int32 MW, int32 MH, FIntPoint Center, int32 DrawSize);   // DrawSize<=0 なら等倍
+
+	void UpdateFollowerRotations(); // 毎フレーム：各フォロワーの回転をカメラ基準で更新
+
+	void PlaceFollowerCentered(int32 CellIndex);
+
+	void CacheCenterOffsetLocal(int32 CellIndex);
+
+	void RecordTrailPoint(const FVector2D& Pixel);     // 毎フレーム（テストでは着弾時）に呼ぶ
+	void RequestTrailSave(int32 CellIndex, const FString& Path); // 着弾時に予約
+	void ProcessTrailSaveQueue();                      // 毎Tick：2秒経過したら発火
+
+	// 対象プレイヤーカメラ（BPから設定）。とりあえず1台。将来プレイヤー人数分なら配列化。
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Capture")
+	UCameraComponent* m_playerCamera = nullptr;
+
+	// セルごとの「向き合わせ対象アクタ」（＝そのセルに映している実アクタ＝リーダー）
+	// リアルタイム表示中はこれを見て毎フレーム回転を合わせる
+	UPROPERTY()
+	TArray<TObjectPtr<AActor>> m_cellRotationTargets;
 
 	// 全体スケール調整用（後から見た目を一括で詰めたいとき用）
 	UPROPERTY(EditAnywhere, Category = "Capture")
@@ -183,4 +226,36 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Capture")
 	FString m_snapshotOutputPath = TEXT("H:\\HDriveUE5Projects\\Lancher5.3\\DrawLineReadBackTest\\TrajectoryReadback.png");
+
+	// マーク画像（着弾点）のリテラルパス。エディタで差し替えたいなら EditAnywhere のままでOK
+	UPROPERTY(EditAnywhere, Category = "Capture")
+	FString m_markTexturePath = TEXT("/Game/texture1.texture1");
+
+	// 着弾マークの描画サイズ（px、1辺）。0以下なら元画像サイズで描く
+	UPROPERTY(EditAnywhere, Category = "Capture")
+	int32 m_markDrawSize = 32;
+
+	// 起動時にCPUへ展開したマーク画像（ワーカースレッドで参照する）
+	TArray<FColor> m_markPixels;
+	int32 m_markW = 0;
+	int32 m_markH = 0;
+
+	TArray<FVector> m_cellCenterLocal; // BeginPlayで SetNum(セル数)
+
+	TArray<FTrailPoint> m_trailPoints;          // 狙い点の履歴（時刻順）
+	TArray<FTrailSaveRequest> m_trailSaveQueue; // 2秒後発火待ち
+
+	UPROPERTY(EditAnywhere, Category = "Trail")
+	float m_trailBeforeSec = 3.0f;   // 着弾より前 何秒ぶん描くか（青）
+
+	UPROPERTY(EditAnywhere, Category = "Trail")
+	float m_trailAfterSec = 2.0f;    // 着弾より後 何秒ぶん描くか（赤）
+
+	UPROPERTY(EditAnywhere, Category = "Trail")
+	int32 m_trailThickness = 3;      // 線の太さ（px）
+
+	int32 m_shotCounter = 0;
+
+	UPROPERTY(EditAnywhere, Category = "Capture")
+	FString m_outputDir = TEXT("H:\\HDriveUE5Projects\\Lancher5.3\\DrawLineReadBackTest\\");
 };
